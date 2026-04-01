@@ -3,14 +3,14 @@
 Health Monitoring Webhook - FastAPI + Line Messaging API
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import httpx
-import json
 import re
 import os
 from datetime import datetime
-from database import save_record, get_history
+
+from database import save_record, get_history, save_location, get_location, db
 from classifier import classify_risk, RiskLevel
 from line_messages import (
     build_green_message,
@@ -21,13 +21,12 @@ from line_messages import (
 
 app = FastAPI(title="NCDs Health Monitor", version="1.0.0")
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "YOUR_TOKEN_HERE")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-# Line ID ของ อสม. และเจ้าหน้าที่ รพ.สต. (ใส่ userId จริง)
-VOLUNTEER_GROUP_ID = os.getenv("VOLUNTEER_GROUP_ID", "Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-STAFF_GROUP_ID = os.getenv("STAFF_GROUP_ID", "Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+VOLUNTEER_GROUP_ID = os.getenv("VOLUNTEER_GROUP_ID", "")
+STAFF_GROUP_ID = os.getenv("STAFF_GROUP_ID", "")
 
 
 @app.get("/")
@@ -38,11 +37,9 @@ async def root():
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
-
     for event in body.get("events", []):
         if event["type"] == "message":
             await handle_message(event)
-
     return JSONResponse(content={"status": "ok"})
 
 
@@ -56,42 +53,39 @@ async def handle_message(event: dict):
         await process_health_text(text, reply_token, user_id)
 
     elif msg_type == "image":
-        # TODO: ส่งรูปไป OCR (Google Vision API / Tesseract)
-        await reply_message(reply_token, [
-            {"type": "text", "text": "📷 ได้รับรูปภาพแล้วค่ะ\nกรุณาพิมพ์ค่าในรูปแบบ:\n\nความดัน/น้ำตาล\nตัวอย่าง: 125/82, 108"}
-        ])
+        await reply_message(reply_token, [{
+            "type": "text",
+            "text": "📷 ได้รับรูปภาพแล้วค่ะ\nกรุณาพิมพ์ค่าในรูปแบบ:\n\nความดัน/น้ำตาล\nตัวอย่าง: 125/82, 108"
+        }])
 
     elif msg_type == "location":
-        # บันทึกพิกัดบ้านของผู้ใช้
         lat = event["message"]["latitude"]
         lng = event["message"]["longitude"]
-        await save_user_location(user_id, lat, lng)
-        await reply_message(reply_token, [
-            {"type": "text", "text": f"📍 บันทึกพิกัดบ้านของท่านเรียบร้อยแล้วค่ะ\n({lat:.4f}, {lng:.4f})\nระบบจะใช้พิกัดนี้หากเกิดเหตุฉุกเฉิน"}
-        ])
+        await save_location(user_id, lat, lng)
+        await reply_message(reply_token, [{
+            "type": "text",
+            "text": f"📍 บันทึกพิกัดบ้านของท่านเรียบร้อยแล้วค่ะ\n({lat:.4f}, {lng:.4f})\nระบบจะใช้พิกัดนี้หากเกิดเหตุฉุกเฉิน"
+        }])
 
 
 async def process_health_text(text: str, reply_token: str, user_id: str):
-    """แยกค่าความดันและน้ำตาลจากข้อความ แล้วจำแนกระดับความเสี่ยง"""
-
     parsed = parse_health_values(text)
 
     if not parsed:
-        # ข้อความไม่ใช่ค่าสุขภาพ — อาจเป็นคำถามทั่วไป
-        await reply_message(reply_token, [
-            {"type": "text", "text": (
+        await reply_message(reply_token, [{
+            "type": "text",
+            "text": (
                 "สวัสดีค่ะ 😊 กรุณาส่งค่าในรูปแบบ:\n\n"
                 "📌 ความดัน/น้ำตาล\n"
                 "ตัวอย่าง: 125/82, 108\n\n"
                 "หรือส่งพิกัดบ้านเพื่อบันทึกข้อมูลที่อยู่ค่ะ"
-            )}
-        ])
+            )
+        }])
         return
 
     systolic, diastolic, glucose = parsed
     risk = classify_risk(systolic, diastolic, glucose)
 
-    # บันทึกลง database
     record = {
         "user_id": user_id,
         "systolic": systolic,
@@ -102,44 +96,28 @@ async def process_health_text(text: str, reply_token: str, user_id: str):
     }
     await save_record(record)
 
-    # สร้างข้อความตอบกลับตามระดับเสี่ยง
     if risk == RiskLevel.GREEN:
         messages = build_green_message(systolic, diastolic, glucose)
-
     elif risk == RiskLevel.YELLOW:
         messages = build_yellow_message(systolic, diastolic, glucose)
-
     elif risk == RiskLevel.ORANGE:
         messages = build_orange_message(systolic, diastolic, glucose)
-        # แจ้งเตือน อสม.
         await notify_volunteer(user_id, systolic, diastolic, glucose, risk)
-
     elif risk == RiskLevel.RED:
         messages = build_red_message(systolic, diastolic, glucose)
-        # แจ้งเตือนด่วน อสม. + รพ.สต. พร้อมพิกัด
         await notify_emergency(user_id, systolic, diastolic, glucose)
 
     await reply_message(reply_token, messages)
 
 
 def parse_health_values(text: str):
-    """
-    แยกค่าจากข้อความ รองรับหลายรูปแบบ:
-    - "125/82, 108"
-    - "ความดัน 125/82 น้ำตาล 108"
-    - "125 82 108"
-    - "BP 125/82 glucose 108"
-    คืนค่า (systolic, diastolic, glucose) หรือ None
-    """
     text = text.replace("，", ",").replace("／", "/")
 
-    # รูปแบบ: 125/82, 108
     pattern1 = r"(\d{2,3})\s*/\s*(\d{2,3})\s*[,\s]\s*(\d{2,3})"
     m = re.search(pattern1, text)
     if m:
         return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-    # รูปแบบ: 3 ตัวเลขต่อกัน (systolic diastolic glucose)
     pattern2 = r"(\d{2,3})\s+(\d{2,3})\s+(\d{2,3})"
     m = re.search(pattern2, text)
     if m:
@@ -159,6 +137,8 @@ async def reply_message(reply_token: str, messages: list):
 
 
 async def push_message(to: str, messages: list):
+    if not to:
+        return
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -169,7 +149,6 @@ async def push_message(to: str, messages: list):
 
 
 async def notify_volunteer(user_id: str, sys: int, dia: int, glucose: int, risk):
-    """แจ้ง อสม. ให้ติดตามผู้ป่วย (กลุ่มสีส้ม)"""
     name = await get_user_name(user_id)
     text = (
         f"🟠 แจ้งเตือนจากระบบ NCDs\n"
@@ -183,9 +162,8 @@ async def notify_volunteer(user_id: str, sys: int, dia: int, glucose: int, risk)
 
 
 async def notify_emergency(user_id: str, sys: int, dia: int, glucose: int):
-    """แจ้งเหตุฉุกเฉินพร้อมพิกัด (กลุ่มสีแดง)"""
     name = await get_user_name(user_id)
-    location = await get_user_location(user_id)
+    location = await get_location(user_id)
 
     alert_text = (
         f"🚨 เหตุฉุกเฉิน! ระดับวิกฤต\n"
@@ -197,7 +175,6 @@ async def notify_emergency(user_id: str, sys: int, dia: int, glucose: int):
 
     messages = [{"type": "text", "text": alert_text}]
 
-    # แนบพิกัดถ้ามี
     if location:
         messages.append({
             "type": "location",
@@ -207,24 +184,11 @@ async def notify_emergency(user_id: str, sys: int, dia: int, glucose: int):
             "longitude": location["lng"],
         })
 
-    # ส่งทั้ง อสม. และเจ้าหน้าที่
     await push_message(VOLUNTEER_GROUP_ID, messages)
     await push_message(STAFF_GROUP_ID, messages)
 
 
-async def save_user_location(user_id: str, lat: float, lng: float):
-    """บันทึกพิกัดบ้าน"""
-    from database import db
-    db["locations"][user_id] = {"lat": lat, "lng": lng}
-
-
-async def get_user_location(user_id: str):
-    from database import db
-    return db["locations"].get(user_id)
-
-
 async def get_user_name(user_id: str) -> str:
-    """ดึงชื่อจาก Line Profile API"""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
