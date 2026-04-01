@@ -5,22 +5,14 @@ Database Module — จัดเก็บข้อมูลสุขภาพแ
 """
 
 import json
-import os
-from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 RECORDS_FILE = DATA_DIR / "health_records.json"
 LOCATIONS_FILE = DATA_DIR / "locations.json"
-
-
-# In-memory store (โหลดจาก disk ตอนเริ่ม)
-db = {
-    "records": _load_json(RECORDS_FILE, default=[]),
-    "locations": _load_json(LOCATIONS_FILE, default={}),
-}
 
 
 def _load_json(path: Path, default):
@@ -34,6 +26,13 @@ def _load_json(path: Path, default):
 
 def _save_json(path: Path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# In-memory store (โหลดจาก disk ตอนเริ่ม)
+db = {
+    "records": _load_json(RECORDS_FILE, default=[]),
+    "locations": _load_json(LOCATIONS_FILE, default={}),
+}
 
 
 async def save_record(record: dict):
@@ -60,6 +59,16 @@ async def get_all_records(date_from: str = None, date_to: str = None) -> list:
 
 async def get_risk_summary() -> dict:
     """สรุปจำนวนตามระดับความเสี่ยง"""
-    from collections import Counter
     levels = [r["risk_level"] for r in db["records"]]
     return dict(Counter(levels))
+
+
+async def save_location(user_id: str, lat: float, lng: float):
+    """บันทึกพิกัดบ้าน"""
+    db["locations"][user_id] = {"lat": lat, "lng": lng}
+    _save_json(LOCATIONS_FILE, db["locations"])
+
+
+async def get_location(user_id: str):
+    """ดึงพิกัดบ้าน"""
+    return db["locations"].get(user_id)
